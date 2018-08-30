@@ -7,6 +7,7 @@
 #include "Monotonic.h"
 #include "Scope.h"
 #include "Simplify.h"
+#include "Solve.h"
 #include "Substitute.h"
 
 namespace Halide {
@@ -42,12 +43,38 @@ public:
     }
 };
 
+// Determines if the visited statement (which should a loop) is safe to extend
+// for more iterations while wrapping every Provide statement into an If stmt
+// that does nothing on the added iterations. Extending is not safe if any
+// loads (that may fault) or impure calls occur outside Provide (and so outside
+// of the guarding condition).
+class LoopSafeToExtend : public IRVisitor {
+    using IRVisitor::visit;
+    bool inside_provide = false;
+
+    void visit(const Provide *op) {
+        ScopedValue<bool> sb(inside_provide, true);
+        IRVisitor::visit(op);
+    }
+
+    void visit(const Call *op) {
+      if (!inside_provide &&
+          (op->call_type == Call::Image || op->call_type == Call::Halide ||
+           !op->is_pure())) {
+          result = false;
+      }
+      IRVisitor::visit(op);
+    }
+
+public:
+    bool result = true;
+};
+
 bool expr_depends_on_var(Expr e, string v) {
     ExprDependsOnVar depends(v);
     e.accept(&depends);
     return depends.result;
 }
-
 
 class ExpandExpr : public IRMutator2 {
     using IRMutator2::visit;
@@ -56,7 +83,7 @@ class ExpandExpr : public IRMutator2 {
     Expr visit(const Variable *var) override {
         if (scope.contains(var->name)) {
             Expr expr = scope.get(var->name);
-            debug(3) << "Fully expanded " << var->name << " -> " << expr << "\n";
+            debug(4) << "Fully expanded " << var->name << " -> " << expr << "\n";
             return expr;
         } else {
             return var;
@@ -72,11 +99,42 @@ public:
 Expr expand_expr(Expr e, const Scope<Expr> &scope) {
     ExpandExpr ee(scope);
     Expr result = ee.mutate(e);
-    debug(3) << "Expanded " << e << " into " << result << "\n";
+    debug(4) << "Expanded " << e << " into " << result << "\n";
     return result;
 }
 
-}
+// Describes how to extend a single loop by adding iterations at the start.
+struct LoopExtension {
+    // Number of iterations we add to the start of the loop. Always positive.
+    // This is the maximum across all per-Func increases.
+    int64_t max_increase;
+    // Map from a Func name to the number of iterations we add to the loop to
+    // align the realization of this Func with its consumer.
+    map<string, int64_t> increase_per_func;
+
+    LoopExtension() : max_increase(0) {}
+
+    // Records the intent to extend the loop by the given number of iterations
+    // to align the specified Func.
+    void extend_for_func(const string& func, int64_t increase) {
+        internal_assert(increase > 0);
+        increase_per_func.insert(std::make_pair(func, increase));
+        max_increase = std::max(max_increase, increase);
+    }
+
+    // Returns the first iteration of the extended loop on which the values
+    // of the given Func should start to be computed. If the Func is not one
+    // of those we wanted to align, this is the original (before extension)
+    // first iteration of the loop.
+    int64_t first_iteration_for_func(const string& func) const {
+        auto it = increase_per_func.find(func);
+        if (it == increase_per_func.end()) {
+            return max_increase;
+        } else {
+            return max_increase - it->second;
+        }
+    }
+};
 
 // Perform sliding window optimization for a function over a
 // particular serial for loop
@@ -84,7 +142,8 @@ class SlidingWindowOnFunctionAndLoop : public IRMutator2 {
     Function func;
     string loop_var;
     Expr loop_min;
-    Scope<Expr> scope;
+    bool can_extend;
+    Scope<Expr> &scope;
 
     map<string, Expr> replacements;
 
@@ -105,6 +164,35 @@ class SlidingWindowOnFunctionAndLoop : public IRMutator2 {
             }
         }
         return true;
+    }
+
+    // Returns positive number of iterations to add to the start of the loop so
+    // that those iterations cover the overall region starting at min_required
+    // while the inner loop starts at min_computed for every iteration. Returns
+    // zero if we cannot extend the loop or cannot compute a constant number of
+    // iterations to add.
+    int64_t try_to_extend_loop(Expr min_required, Expr min_computed) {
+        if (!can_extend) {
+            return 0;
+        }
+        // Handling functions with updates should be possible, but left out
+        // for now for simplicity.
+        if (!func.updates().empty()) {
+            return 0;
+        }
+        // Find the overall min of the required regions for all iterations;
+        // because of the monotonicity, it occurs on the first iteration.
+        Expr overall_min_required = substitute(loop_var, loop_min, min_required);
+        // Find the largest value of the loop variable that results in
+        // the new loop starting at or below the overall min.
+        Interval loop_var_low_enough =
+            solve_for_inner_interval(min_computed <= overall_min_required, loop_var);
+        if (!loop_var_low_enough.has_upper_bound()) {
+            return 0;
+        }
+        auto extra_iterations = simplify(loop_min - loop_var_low_enough.max);
+        auto increase = as_const_int(extra_iterations);
+        return increase ? *increase : 0;
     }
 
     Stmt visit(const ProducerConsumer *op) override {
@@ -233,6 +321,22 @@ class SlidingWindowOnFunctionAndLoop : public IRMutator2 {
                 return stmt;
             }
 
+            // Try to extend outer loop boundary to immediately enter steady state.
+            if (monotonic_min == Monotonic::Increasing) {
+                int64_t increase = try_to_extend_loop(min_required, prev_max_plus_one);
+                if (increase > 0) {
+                    // TODO: lower debug level.
+                    debug(0) << "Aligning realization of " << func.name()
+                             << " over dimension " << dim
+                             << " along loop variable " << loop_var
+                             << " by pushing loop_min back by: "
+                             << increase << "\n";
+                    loop_extent_increase = increase;
+                    replacements[prefix + dim + ".min"] = prev_max_plus_one;
+                    return stmt;
+                }
+            }
+
             Expr new_min, new_max;
             if (can_slide_up) {
                 new_min = select(loop_var_expr <= loop_min, min_required, likely_if_innermost(prev_max_plus_one));
@@ -328,25 +432,43 @@ class SlidingWindowOnFunctionAndLoop : public IRMutator2 {
     }
 
 public:
-    SlidingWindowOnFunctionAndLoop(Function f, string v, Expr v_min) : func(f), loop_var(v), loop_min(v_min) {}
+    SlidingWindowOnFunctionAndLoop(Function f, string v, Expr v_min, bool can_extend, Scope<Expr> &scope)
+        : func(f), loop_var(v), loop_min(v_min), can_extend(can_extend), scope(scope), loop_extent_increase(0) {}
+
+    int loop_extent_increase;
 };
 
 // Perform sliding window optimization for a particular function
 class SlidingWindowOnFunction : public IRMutator2 {
     Function func;
+    Scope<Expr> &scope;
+    map<string, LoopExtension> &loop_extensions;
 
     using IRMutator2::visit;
 
     Stmt visit(const For *op) override {
-        debug(3) << " Doing sliding window analysis over loop: " << op->name << "\n";
-
         Stmt new_body = op->body;
-
         new_body = mutate(new_body);
 
-        if (op->for_type == ForType::Serial ||
-            op->for_type == ForType::Unrolled) {
-            new_body = SlidingWindowOnFunctionAndLoop(func, op->name, op->min).mutate(new_body);
+        debug(3) << " Doing sliding window analysis over loop: " << op->name << "\n";
+        debug(3) << " Loop body:\n" << new_body << "\n";
+
+        Expr extent = simplify(expand_expr(op->extent, scope));
+
+        if (!is_one(extent) && (op->for_type == ForType::Serial ||
+                                op->for_type == ForType::Unrolled)) {
+            LoopSafeToExtend safe_to_extend;
+            op->accept(&safe_to_extend);
+
+            SlidingWindowOnFunctionAndLoop mut(func, op->name, op->min, safe_to_extend.result, scope);
+            new_body = mut.mutate(new_body);
+
+            if (mut.loop_extent_increase > 0) {
+                auto it = loop_extensions
+                              .insert(std::make_pair(op->name, LoopExtension()))
+                              .first;
+                it->second.extend_for_func(func.name(), mut.loop_extent_increase);
+            }
         }
 
         if (new_body.same_as(op->body)) {
@@ -356,13 +478,31 @@ class SlidingWindowOnFunction : public IRMutator2 {
         }
     }
 
+    Stmt visit(const LetStmt *op) override {
+        ScopedBinding<Expr> bind(scope, op->name, simplify(expand_expr(op->value, scope)));
+        return IRMutator2::visit(op);
+    }
+
 public:
-    SlidingWindowOnFunction(Function f) : func(f) {}
+    SlidingWindowOnFunction(Function f,
+                            Scope<Expr> &scope,
+                            map<string, LoopExtension> &loop_extensions)
+        : func(f), scope(scope), loop_extensions(loop_extensions) {}
 };
+
+bool maybe_strip_suffix(const std::string &src, const std::string &suffix,
+                        std::string *dst) {
+    if (ends_with(src, suffix)) {
+        *dst = src.substr(0, src.length() - suffix.length());
+        return true;
+    }
+    return false;
+}
 
 // Perform sliding window optimization for all functions
 class SlidingWindow : public IRMutator2 {
     const map<string, Function> &env;
+    Scope<Expr> scope;
 
     using IRMutator2::visit;
 
@@ -387,7 +527,8 @@ class SlidingWindow : public IRMutator2 {
 
         debug(3) << "Doing sliding window analysis on realization of " << op->name << "\n";
 
-        new_body = SlidingWindowOnFunction(iter->second).mutate(new_body);
+        new_body = SlidingWindowOnFunction(iter->second, scope, loop_extensions)
+                       .mutate(new_body);
 
         new_body = mutate(new_body);
 
@@ -398,13 +539,113 @@ class SlidingWindow : public IRMutator2 {
                                  op->bounds, op->condition, new_body);
         }
     }
+
+    Stmt visit(const LetStmt *op) override {
+        ScopedBinding<Expr> bind(scope, op->name, simplify(expand_expr(op->value, scope)));
+        return IRMutator2::visit(op);
+    }
+
 public:
     SlidingWindow(const map<string, Function> &e) : env(e) {}
 
+    // Tracks the loops where we add iterations at the start, to align the loop
+    // with some inner loop. The key is the name of the loop variable.
+    map<string, LoopExtension> loop_extensions;
 };
 
+// Extends a single loop by adding some iterations at the start, and adds
+// guarding If statements so that the additional iterations skip over Provides
+// of Funcs that we don't want to compute on those iterations.
+class ExtendLoop : public IRMutator2 {
+    const string name;
+    const LoopExtension extension;
+
+    bool in_target_loop = false;
+    Expr loop_min;
+    int64_t first_iteration = 0;
+
+    using IRMutator2::visit;
+
+    // Modifies the lower bound and the extent of the target loop.
+    Stmt visit(const LetStmt *op) override {
+        Stmt new_body = mutate(op->body);
+        Expr value = op->value;
+
+        int increment = find_adjustment(op->name);
+        if (increment != 0) {
+            value = simplify(value + increment);
+        }
+
+        if (new_body.same_as(op->body) && value.same_as(op->value)) {
+            return op;
+        } else {
+            return LetStmt::make(op->name, value, new_body);
+        }
+    }
+
+    // Detects when we enter the target loop.
+    Stmt visit(const For *op) override {
+        if (op->name != name) {
+            return IRMutator2::visit(op);
+        }
+        ScopedValue<bool> in_loop_sv(in_target_loop, true);
+        loop_min = op->min;
+        first_iteration = extension.max_increase;
+        return IRMutator2::visit(op);
+    }
+
+    // Tracks the first iteration based on the Func we are producing.
+    Stmt visit(const ProducerConsumer *op) override {
+        if (!in_target_loop || !op->is_producer) {
+            return IRMutator2::visit(op);
+        }
+        int64_t new_first_iteration =
+            std::min(first_iteration, extension.first_iteration_for_func(op->name));
+        ScopedValue<int64_t> first_iter_sv(
+            first_iteration, new_first_iteration);
+        return IRMutator2::visit(op);
+    }
+
+    // Adds guarding Ifs around Provides.
+    Stmt visit(const Provide *op) override {
+        if (!in_target_loop || first_iteration == 0) {
+            return IRMutator2::visit(op);
+        }
+        // loop_var >= loop_min + first_iteration.
+        Expr cond = Variable::make(loop_min.type(), name) >= loop_min +
+            static_cast<int>(first_iteration);
+        return IfThenElse::make(cond, op);
+    }
+
+    // Returns the adjustment to the value of the given variable if defines
+    // the loop bound of the loop we are extending, or zero if the variable
+    // doesn't need to be changed.
+    int64_t find_adjustment(const std::string &var_name) const {
+        int64_t sign;
+        std::string loop_var;
+        if (maybe_strip_suffix(var_name, ".loop_min", &loop_var)) {
+            sign = -1;
+        } else if (maybe_strip_suffix(var_name, ".loop_extent", &loop_var)) {
+            sign = 1;
+        } else {
+            return 0;
+        }
+        return loop_var == name ? sign * extension.max_increase : 0;
+    }
+
+public:
+    ExtendLoop(const string &n, const LoopExtension &e) : name(n), extension(e) {}
+};
+
+}  // namespace
+
 Stmt sliding_window(Stmt s, const map<string, Function> &env) {
-    return SlidingWindow(env).mutate(s);
+    SlidingWindow mut(env);
+    Stmt r = mut.mutate(s);
+    for (const auto &loop_ext : mut.loop_extensions) {
+        r = ExtendLoop(loop_ext.first, loop_ext.second).mutate(r);
+    }
+    return r;
 }
 
 }  // namespace Internal

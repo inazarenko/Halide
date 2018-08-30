@@ -368,20 +368,28 @@ class AttemptStorageFoldingOfFunction : public IRMutator {
 
             // First, attempt to detect if the loop is monotonically
             // increasing or decreasing (if we allow automatic folding).
-            bool min_monotonic_increasing =
-                (!explicit_only &&
-                 is_monotonic(min_steady, op->name) == Monotonic::Increasing &&
-                 can_prove(min_steady >= min_initial));
-
-            bool max_monotonic_decreasing =
-                (!explicit_only &&
-                 is_monotonic(max_steady, op->name) == Monotonic::Decreasing &&
-                 can_prove(max_steady <= max_initial));
+            bool has_monotonic_bound = false, fold_forward = false;
+            if (!explicit_only) {
+                auto min_direction = is_monotonic(min_steady, op->name);
+                has_monotonic_bound =
+                    (min_direction == Monotonic::Increasing && can_prove(min_steady >= min_initial))
+                    || (min_direction == Monotonic::Decreasing && can_prove(min_steady <= min_initial));
+                if (has_monotonic_bound) {
+                    fold_forward = min_direction == Monotonic::Increasing;
+                } else {
+                    auto max_direction = is_monotonic(max_steady, op->name);
+                    has_monotonic_bound =
+                        (max_direction == Monotonic::Increasing && can_prove(max_steady >= max_initial))
+                        || (max_direction == Monotonic::Decreasing && can_prove(max_steady <= max_initial));
+                    if (has_monotonic_bound) {
+                        fold_forward = max_direction == Monotonic::Increasing;
+                    }
+                }
+            }
 
             if (explicit_factor.defined()) {
                 bool can_skip_dynamic_checks =
-                    ((min_monotonic_increasing || max_monotonic_decreasing) &&
-                     can_prove(extent <= explicit_factor));
+                    (has_monotonic_bound && can_prove(extent <= explicit_factor));
                 if (!can_skip_dynamic_checks) {
                     // If we didn't find a monotonic dimension, or
                     // couldn't prove the extent was small enough, and we
@@ -398,17 +406,14 @@ class AttemptStorageFoldingOfFunction : public IRMutator {
                                               op->name,
                                               dim,
                                               storage_dim).mutate(body);
-                    if (storage_dim.fold_forward) {
-                        min_monotonic_increasing = true;
-                    } else {
-                        max_monotonic_decreasing = true;
-                    }
+                    has_monotonic_bound = true;
+                    fold_forward = storage_dim.fold_forward;
                 }
             }
 
             // The min or max has to be monotonic with the loop
             // variable, and should depend on the loop variable.
-            if (min_monotonic_increasing || max_monotonic_decreasing) {
+            if (has_monotonic_bound) {
                 Expr factor;
                 if (explicit_factor.defined()) {
                     // We were either able to prove monotonicity
@@ -452,7 +457,7 @@ class AttemptStorageFoldingOfFunction : public IRMutator {
                         stmt = For::make(op->name, op->min, op->extent, op->for_type, op->device_api, body);
                         if (!dynamic_footprint.empty()) {
                             Expr init_val;
-                            if (min_monotonic_increasing) {
+                            if (fold_forward) {
                                 init_val = Int(32).min();
                             } else {
                                 init_val = Int(32).max();
