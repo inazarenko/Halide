@@ -122,11 +122,10 @@ struct LoopExtension {
         max_increase = std::max(max_increase, increase);
     }
 
-    // Returns the first iteration of the extended loop on which the values
-    // of the given Func should start to be computed. If the Func is not one
-    // of those we wanted to align, this is the original (before extension)
-    // first iteration of the loop.
-    int64_t first_iteration_for_func(const string& func) const {
+    // Returns the number of iterations of the extended loop to skip when
+    // computing the values of the given Func. If the Func is not one of those
+    // we wanted to align, we skip all additional iterations.
+    int64_t first_iteration_for_func(const string &func) const {
         auto it = increase_per_func.find(func);
         if (it == increase_per_func.end()) {
             return max_increase;
