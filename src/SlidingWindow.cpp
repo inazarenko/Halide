@@ -437,58 +437,6 @@ public:
     int loop_extent_increase;
 };
 
-// Perform sliding window optimization for a particular function
-class SlidingWindowOnFunction : public IRMutator2 {
-    Function func;
-    Scope<Expr> &scope;
-    map<string, LoopExtension> &loop_extensions;
-
-    using IRMutator2::visit;
-
-    Stmt visit(const For *op) override {
-        Stmt new_body = op->body;
-        new_body = mutate(new_body);
-
-        debug(3) << " Doing sliding window analysis over loop: " << op->name << "\n";
-        debug(3) << " Loop body:\n" << new_body << "\n";
-
-        Expr extent = simplify(expand_expr(op->extent, scope));
-
-        if (!is_one(extent) && (op->for_type == ForType::Serial ||
-                                op->for_type == ForType::Unrolled)) {
-            LoopSafeToExtend safe_to_extend;
-            op->accept(&safe_to_extend);
-
-            SlidingWindowOnFunctionAndLoop mut(func, op->name, op->min, safe_to_extend.result, scope);
-            new_body = mut.mutate(new_body);
-
-            if (mut.loop_extent_increase > 0) {
-                auto it = loop_extensions
-                              .insert(std::make_pair(op->name, LoopExtension()))
-                              .first;
-                it->second.extend_for_func(func.name(), mut.loop_extent_increase);
-            }
-        }
-
-        if (new_body.same_as(op->body)) {
-            return op;
-        } else {
-            return For::make(op->name, op->min, op->extent, op->for_type, op->device_api, new_body);
-        }
-    }
-
-    Stmt visit(const LetStmt *op) override {
-        ScopedBinding<Expr> bind(scope, op->name, simplify(expand_expr(op->value, scope)));
-        return IRMutator2::visit(op);
-    }
-
-public:
-    SlidingWindowOnFunction(Function f,
-                            Scope<Expr> &scope,
-                            map<string, LoopExtension> &loop_extensions)
-        : func(f), scope(scope), loop_extensions(loop_extensions) {}
-};
-
 bool maybe_strip_suffix(const std::string &src, const std::string &suffix,
                         std::string *dst) {
     if (ends_with(src, suffix)) {
@@ -498,10 +446,12 @@ bool maybe_strip_suffix(const std::string &src, const std::string &suffix,
     return false;
 }
 
-// Perform sliding window optimization for all functions
+// Perform sliding window optimization
 class SlidingWindow : public IRMutator2 {
     const map<string, Function> &env;
     Scope<Expr> scope;
+    std::vector<string> funcs;
+    map<string, int64_t> adjustments;
 
     using IRMutator2::visit;
 
@@ -522,57 +472,64 @@ class SlidingWindow : public IRMutator2 {
             return IRMutator2::visit(op);
         }
 
+        funcs.push_back(op->name);
+        Stmt s = IRMutator2::visit(op);
+        funcs.pop_back();
+        return s;
+    }
+
+    Stmt visit(const For *op) override {
         Stmt new_body = op->body;
-
-        debug(3) << "Doing sliding window analysis on realization of " << op->name << "\n";
-
-        new_body = SlidingWindowOnFunction(iter->second, scope, loop_extensions)
-                       .mutate(new_body);
-
         new_body = mutate(new_body);
+
+        debug(3) << " Doing sliding window analysis over loop: " << op->name << "\n";
+
+        Expr extent = simplify(expand_expr(op->extent, scope));
+
+        if (!is_one(extent) && (op->for_type == ForType::Serial ||
+                                op->for_type == ForType::Unrolled)) {
+            LoopSafeToExtend safe_to_extend;
+            op->accept(&safe_to_extend);
+
+            // TODO: I should avoid messing with this loop if it has mutliple
+            // Produce blocks for the same Func, since I rely on Func name to
+            // determine guard offset.
+
+            LoopExtension ext;
+            for (const string &fn : funcs) {
+                auto it = env.find(fn);
+                internal_assert(it != env.end());
+                SlidingWindowOnFunctionAndLoop mut(it->second, op->name, op->min,
+                                                   safe_to_extend.result, scope);
+                new_body = mut.mutate(new_body);
+                if (mut.loop_extent_increase > 0) {
+                    ext.extend_for_func(fn, mut.loop_extent_increase);
+                }
+            }
+
+            if (ext.max_increase > 0) {
+                adjustments[op->name + ".loop_min"] = -ext.max_increase;
+                adjustments[op->name + ".loop_extent"] = ext.max_increase;
+                new_body = GuardAddedIterations(ext, op->min).mutate(new_body);
+            }
+        }
 
         if (new_body.same_as(op->body)) {
             return op;
         } else {
-            return Realize::make(op->name, op->types, op->memory_type,
-                                 op->bounds, op->condition, new_body);
+            return For::make(op->name, op->min, op->extent, op->for_type, op->device_api, new_body);
         }
     }
 
     Stmt visit(const LetStmt *op) override {
         ScopedBinding<Expr> bind(scope, op->name, simplify(expand_expr(op->value, scope)));
-        return IRMutator2::visit(op);
-    }
-
-public:
-    SlidingWindow(const map<string, Function> &e) : env(e) {}
-
-    // Tracks the loops where we add iterations at the start, to align the loop
-    // with some inner loop. The key is the name of the loop variable.
-    map<string, LoopExtension> loop_extensions;
-};
-
-// Extends a single loop by adding some iterations at the start, and adds
-// guarding If statements so that the additional iterations skip over Provides
-// of Funcs that we don't want to compute on those iterations.
-class ExtendLoop : public IRMutator2 {
-    const string name;
-    const LoopExtension extension;
-
-    bool in_target_loop = false;
-    Expr loop_min;
-    int64_t first_iteration = 0;
-
-    using IRMutator2::visit;
-
-    // Modifies the lower bound and the extent of the target loop.
-    Stmt visit(const LetStmt *op) override {
         Stmt new_body = mutate(op->body);
-        Expr value = op->value;
+        Expr value = mutate(op->value);
 
-        int increment = find_adjustment(op->name);
-        if (increment != 0) {
-            value = simplify(value + increment);
+        auto it = adjustments.find(op->name);
+        if (it != adjustments.end()) {
+            value = value + it->second;
+            adjustments.erase(it);
         }
 
         if (new_body.same_as(op->body) && value.same_as(op->value)) {
@@ -582,69 +539,50 @@ class ExtendLoop : public IRMutator2 {
         }
     }
 
-    // Detects when we enter the target loop.
-    Stmt visit(const For *op) override {
-        if (op->name != name) {
-            return IRMutator2::visit(op);
-        }
-        ScopedValue<bool> in_loop_sv(in_target_loop, true);
-        loop_min = op->min;
-        first_iteration = extension.max_increase;
-        return IRMutator2::visit(op);
-    }
+public:
+    SlidingWindow(const map<string, Function> &e) : env(e) {}
+};
+
+// Adds guarding If statements so that additional loop iterations skip over
+// Provides of Funcs that we don't want to compute on those iterations.
+class GuardAddedIterations : public IRMutator2 {
+    const LoopExtension extension;
+    Expr loop_min;
+    int64_t first_iteration;
+
+    using IRMutator2::visit;
 
     // Tracks the first iteration based on the Func we are producing.
     Stmt visit(const ProducerConsumer *op) override {
-        if (!in_target_loop || !op->is_producer) {
+        if (!op->is_producer) {
             return IRMutator2::visit(op);
         }
         int64_t new_first_iteration =
             std::min(first_iteration, extension.first_iteration_for_func(op->name));
-        ScopedValue<int64_t> first_iter_sv(
-            first_iteration, new_first_iteration);
+        ScopedValue<int64_t> first_iter_sv(first_iteration, new_first_iteration);
         return IRMutator2::visit(op);
     }
 
     // Adds guarding Ifs around Provides.
     Stmt visit(const Provide *op) override {
-        if (!in_target_loop || first_iteration == 0) {
+        if (first_iteration == 0) {
             return IRMutator2::visit(op);
         }
         // loop_var >= loop_min + first_iteration.
         Expr cond = Variable::make(loop_min.type(), name) >= loop_min +
-            static_cast<int>(first_iteration);
+            IntImm::make(loop_min.type(), first_iteration);
         return IfThenElse::make(cond, op);
     }
 
-    // Returns the adjustment to the value of the given variable if defines
-    // the loop bound of the loop we are extending, or zero if the variable
-    // doesn't need to be changed.
-    int64_t find_adjustment(const std::string &var_name) const {
-        int64_t sign;
-        std::string loop_var;
-        if (maybe_strip_suffix(var_name, ".loop_min", &loop_var)) {
-            sign = -1;
-        } else if (maybe_strip_suffix(var_name, ".loop_extent", &loop_var)) {
-            sign = 1;
-        } else {
-            return 0;
-        }
-        return loop_var == name ? sign * extension.max_increase : 0;
-    }
-
 public:
-    ExtendLoop(const string &n, const LoopExtension &e) : name(n), extension(e) {}
+    GuardAddedIterations(const LoopExtension &e, Expr loop_min)
+        : extension(e), loop_min(loop_min), first_iteration(ext.max_increase) {}
 };
 
 }  // namespace
 
 Stmt sliding_window(Stmt s, const map<string, Function> &env) {
-    SlidingWindow mut(env);
-    Stmt r = mut.mutate(s);
-    for (const auto &loop_ext : mut.loop_extensions) {
-        r = ExtendLoop(loop_ext.first, loop_ext.second).mutate(r);
-    }
-    return r;
+    return SlidingWindow(env).mutate(s);
 }
 
 }  // namespace Internal
