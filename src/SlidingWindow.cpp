@@ -443,23 +443,12 @@ class GuardAddedIterations : public IRMutator2 {
     const LoopExtension extension;
     string loop_var;
     Expr loop_min;
-    int64_t first_iteration;
 
     using IRMutator2::visit;
 
-    // Tracks the first iteration based on the Func we are producing.
-    Stmt visit(const ProducerConsumer *op) override {
-        if (!op->is_producer) {
-            return IRMutator2::visit(op);
-        }
-        int64_t new_first_iteration =
-            std::min(first_iteration, extension.first_iteration_for_func(op->name));
-        ScopedValue<int64_t> first_iter_sv(first_iteration, new_first_iteration);
-        return IRMutator2::visit(op);
-    }
-
     // Adds guarding Ifs around Provides.
     Stmt visit(const Provide *op) override {
+        int64_t first_iteration = extension.first_iteration_for_func(op->name);
         if (first_iteration == 0) {
             return IRMutator2::visit(op);
         }
@@ -471,7 +460,7 @@ class GuardAddedIterations : public IRMutator2 {
 
 public:
     GuardAddedIterations(const LoopExtension &e, const string &loop_var, const Expr &loop_min)
-        : extension(e), loop_var(loop_var), loop_min(loop_min), first_iteration(e.max_increase) {}
+        : extension(e), loop_var(loop_var), loop_min(loop_min) {}
 };
 
 // Perform sliding window optimization

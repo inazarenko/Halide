@@ -12,6 +12,13 @@ using namespace Halide;
 int count = 0;
 extern "C" DLLEXPORT int call_counter(int x, int y) {
     count++;
+    // if (y == 0) {
+    //     printf("call f(%2d)\n", x);
+    // } else if (y == 1) {
+    //     printf("call g(%2d)\n", x);
+    // } else {
+    //     abort();
+    // }
     return 0;
 }
 HalideExtern_2(int, call_counter, int, int);
@@ -108,6 +115,63 @@ int main(int argc, char **argv) {
         // we can skip the y-1 case in all but the first iteration.
         if (count != 100 * 11) {
             printf("f was called %d times instead of %d times\n", count, 100*11);
+            return -1;
+        }
+    }
+
+    // Two independent producers.
+    {
+        count = 0;
+        Func f, g, h;
+        f(x) = call_counter(x, 0);
+        g(x) = call_counter(x, 1);
+        h(x) = f(x) + f(x+1) + g(x-2) + g(x+2);
+
+        f.store_root().compute_at(h, x);
+        g.store_root().compute_at(h, x);
+
+        Buffer<int> im = h.realize(20);
+        constexpr int expected = 21 + 24;
+        if (count != expected) {
+            printf("f/g were called %d times instead of %d times\n", count, expected);
+            return -1;
+        }
+    }
+
+    // Chain of p1 -> p2 -> consumer.
+    {
+        count = 0;
+        Func f, g, h;
+        f(x) = call_counter(x, 0);
+        g(x) = call_counter(x, 1) + f(x) + f(x+1);
+        h(x) = g(x-2) + g(x+2);
+
+        f.store_root().compute_at(h, x);
+        g.store_root().compute_at(h, x);
+
+        Buffer<int> im = h.realize(10);
+        constexpr int expected = 15 + 14;
+        if (count != expected) {
+            printf("f/g were called %d times instead of %d times\n", count, expected);
+            return -1;
+        }
+    }
+
+    // Two independent producers computed in a fused loop.
+    {
+        count = 0;
+        Func f, g, h;
+        f(x) = call_counter(x, 0);
+        g(x) = call_counter(x, 1);
+        h(x) = f(x) + f(x+2) + g(x-2) + g(x+1);
+
+        f.store_root().compute_at(h, x);
+        g.store_root().compute_at(h, x).compute_with(f, x);
+
+        Buffer<int> im = h.realize(10);
+        constexpr int expected = 11 + 14;
+        if (count != expected) {
+            printf("f/g were called %d times instead of %d times\n", count, expected);
             return -1;
         }
     }

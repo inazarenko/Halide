@@ -595,18 +595,13 @@ void IRPrinter::visit(const AssertStmt *op) {
 }
 
 void IRPrinter::visit(const ProducerConsumer *op) {
-    if (op->is_producer) {
-        do_indent();
-        stream << "produce " << op->name << " {\n";
-        indent += 2;
-        print(op->body);
-        indent -= 2;
-        do_indent();
-        stream << "}\n";
-    } else {
-        print(op->body);
-    }
-
+    do_indent();
+    stream << (op->is_producer ? "produce " : "consume ") << op->name << " {\n";
+    indent += 2;
+    print(op->body);
+    indent -= 2;
+    do_indent();
+    stream << "}\n";
 }
 
 void IRPrinter::visit(const For *op) {
