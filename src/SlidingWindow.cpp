@@ -437,14 +437,42 @@ public:
     int loop_extent_increase;
 };
 
-bool maybe_strip_suffix(const std::string &src, const std::string &suffix,
-                        std::string *dst) {
-    if (ends_with(src, suffix)) {
-        *dst = src.substr(0, src.length() - suffix.length());
-        return true;
+// Adds guarding If statements so that additional loop iterations skip over
+// Provides of Funcs that we don't want to compute on those iterations.
+class GuardAddedIterations : public IRMutator2 {
+    const LoopExtension extension;
+    string loop_var;
+    Expr loop_min;
+    int64_t first_iteration;
+
+    using IRMutator2::visit;
+
+    // Tracks the first iteration based on the Func we are producing.
+    Stmt visit(const ProducerConsumer *op) override {
+        if (!op->is_producer) {
+            return IRMutator2::visit(op);
+        }
+        int64_t new_first_iteration =
+            std::min(first_iteration, extension.first_iteration_for_func(op->name));
+        ScopedValue<int64_t> first_iter_sv(first_iteration, new_first_iteration);
+        return IRMutator2::visit(op);
     }
-    return false;
-}
+
+    // Adds guarding Ifs around Provides.
+    Stmt visit(const Provide *op) override {
+        if (first_iteration == 0) {
+            return IRMutator2::visit(op);
+        }
+        // loop_var >= loop_min + first_iteration.
+        Expr cond = Variable::make(loop_min.type(), loop_var) >= loop_min +
+            IntImm::make(loop_min.type(), first_iteration);
+        return IfThenElse::make(cond, op);
+    }
+
+public:
+    GuardAddedIterations(const LoopExtension &e, const string &loop_var, const Expr &loop_min)
+        : extension(e), loop_var(loop_var), loop_min(loop_min), first_iteration(e.max_increase) {}
+};
 
 // Perform sliding window optimization
 class SlidingWindow : public IRMutator2 {
@@ -510,7 +538,7 @@ class SlidingWindow : public IRMutator2 {
             if (ext.max_increase > 0) {
                 adjustments[op->name + ".loop_min"] = -ext.max_increase;
                 adjustments[op->name + ".loop_extent"] = ext.max_increase;
-                new_body = GuardAddedIterations(ext, op->min).mutate(new_body);
+                new_body = GuardAddedIterations(ext, op->name, op->min).mutate(new_body);
             }
         }
 
@@ -528,7 +556,7 @@ class SlidingWindow : public IRMutator2 {
 
         auto it = adjustments.find(op->name);
         if (it != adjustments.end()) {
-            value = value + it->second;
+            value = value + IntImm::make(value.type(), it->second);
             adjustments.erase(it);
         }
 
@@ -541,42 +569,6 @@ class SlidingWindow : public IRMutator2 {
 
 public:
     SlidingWindow(const map<string, Function> &e) : env(e) {}
-};
-
-// Adds guarding If statements so that additional loop iterations skip over
-// Provides of Funcs that we don't want to compute on those iterations.
-class GuardAddedIterations : public IRMutator2 {
-    const LoopExtension extension;
-    Expr loop_min;
-    int64_t first_iteration;
-
-    using IRMutator2::visit;
-
-    // Tracks the first iteration based on the Func we are producing.
-    Stmt visit(const ProducerConsumer *op) override {
-        if (!op->is_producer) {
-            return IRMutator2::visit(op);
-        }
-        int64_t new_first_iteration =
-            std::min(first_iteration, extension.first_iteration_for_func(op->name));
-        ScopedValue<int64_t> first_iter_sv(first_iteration, new_first_iteration);
-        return IRMutator2::visit(op);
-    }
-
-    // Adds guarding Ifs around Provides.
-    Stmt visit(const Provide *op) override {
-        if (first_iteration == 0) {
-            return IRMutator2::visit(op);
-        }
-        // loop_var >= loop_min + first_iteration.
-        Expr cond = Variable::make(loop_min.type(), name) >= loop_min +
-            IntImm::make(loop_min.type(), first_iteration);
-        return IfThenElse::make(cond, op);
-    }
-
-public:
-    GuardAddedIterations(const LoopExtension &e, Expr loop_min)
-        : extension(e), loop_min(loop_min), first_iteration(ext.max_increase) {}
 };
 
 }  // namespace
