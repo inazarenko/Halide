@@ -43,33 +43,6 @@ public:
     }
 };
 
-// Determines if the visited statement (which should a loop) is safe to extend
-// for more iterations while wrapping every Provide statement into an If stmt
-// that does nothing on the added iterations. Extending is not safe if any
-// loads (that may fault) or impure calls occur outside Provide (and so outside
-// of the guarding condition).
-class LoopSafeToExtend : public IRVisitor {
-    using IRVisitor::visit;
-    bool inside_provide = false;
-
-    void visit(const Provide *op) {
-        ScopedValue<bool> sb(inside_provide, true);
-        IRVisitor::visit(op);
-    }
-
-    void visit(const Call *op) {
-      if (!inside_provide &&
-          (op->call_type == Call::Image || op->call_type == Call::Halide ||
-           !op->is_pure())) {
-          result = false;
-      }
-      IRVisitor::visit(op);
-    }
-
-public:
-    bool result = true;
-};
-
 bool expr_depends_on_var(Expr e, string v) {
     ExprDependsOnVar depends(v);
     e.accept(&depends);
@@ -102,6 +75,85 @@ Expr expand_expr(Expr e, const Scope<Expr> &scope) {
     debug(4) << "Expanded " << e << " into " << result << "\n";
     return result;
 }
+
+// Determines if the visited statement (which should a loop) is safe to extend
+// for more iterations while wrapping every Provide statement into an If stmt
+// that does nothing on the added iterations. Extending is not safe if any
+// loads (that may fault) or impure calls occur outside Provide (and so outside
+// of the guarding condition). It's also not safe if there's more than one
+// Produce for some function, since we track the offset for the guards only
+// at function granularity.
+class LoopSafeToExtend : public IRVisitor {
+    const string loop_var;
+    Scope<Expr> scope;
+    map<string, int> produce_count;
+    bool inside_provide = false;
+    bool all_pure = true;
+
+    using IRVisitor::visit;
+
+    void visit(const Provide *op) override {
+        ScopedValue<bool> sb(inside_provide, true);
+        IRVisitor::visit(op);
+    }
+
+    void visit(const ProducerConsumer *op) override {
+        if (op->is_producer) {
+            ++produce_count[op->name];
+        }
+        IRVisitor::visit(op);
+    }
+
+    void visit(const Call *op) override {
+        if (!inside_provide &&
+            (op->call_type == Call::Image || op->call_type == Call::Halide ||
+             !op->is_pure())) {
+            all_pure = false;
+        }
+        IRVisitor::visit(op);
+    }
+
+    void visit(const Div *op) override {
+        if (!inside_provide && !op->type.is_float()) {
+            Expr divisor = expand_expr(op->b, scope);
+            if (expr_depends_on_var(divisor, loop_var)) {
+                all_pure = false;
+            }
+        }
+        IRVisitor::visit(op);
+    }
+
+    void visit(const Load *op) {
+        all_pure = false;
+    }
+
+    void visit(const Store *op) {
+        all_pure = false;
+    }
+
+    void visit(const LetStmt *op) override {
+
+        // TODO THIS IS NOT ENOUGH: For loops also introduce variables.
+
+        ScopedBinding<Expr> bind(scope, op->name, simplify(expand_expr(op->value, scope)));
+        IRVisitor::visit(op);
+    }
+
+public:
+    LoopSafeToExtend(const string &loop_var) : loop_var(loop_var) {}
+
+    bool is_safe() const {
+        if (!all_pure) {
+            return false;
+        }
+        for (const auto &pc : produce_count) {
+            if (pc.second > 1) {
+                return false;
+            }
+        }
+        return true;
+    }
+};
 
 // Describes how to extend a single loop by adding iterations at the start.
 struct LoopExtension {
@@ -505,7 +557,7 @@ class SlidingWindow : public IRMutator2 {
 
         if (!is_one(extent) && (op->for_type == ForType::Serial ||
                                 op->for_type == ForType::Unrolled)) {
-            LoopSafeToExtend safe_to_extend;
+            LoopSafeToExtend safe_to_extend(op->name);
             op->accept(&safe_to_extend);
 
             // TODO: I should avoid messing with this loop if it has mutliple
@@ -517,7 +569,7 @@ class SlidingWindow : public IRMutator2 {
                 auto it = env.find(fn);
                 internal_assert(it != env.end());
                 SlidingWindowOnFunctionAndLoop mut(it->second, op->name, op->min,
-                                                   safe_to_extend.result, scope);
+                                                   safe_to_extend.is_safe(), scope);
                 new_body = mut.mutate(new_body);
                 if (mut.loop_extent_increase > 0) {
                     ext.extend_for_func(fn, mut.loop_extent_increase);
