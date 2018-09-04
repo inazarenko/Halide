@@ -84,8 +84,6 @@ Expr expand_expr(Expr e, const Scope<Expr> &scope) {
 // Produce for some function, since we track the offset for the guards only
 // at function granularity.
 class LoopSafeToExtend : public IRVisitor {
-    const string loop_var;
-    Scope<Expr> scope;
     map<string, int> produce_count;
     bool inside_provide = false;
     bool all_pure = true;
@@ -113,12 +111,11 @@ class LoopSafeToExtend : public IRVisitor {
         IRVisitor::visit(op);
     }
 
+    // Detects integer division by a non-constant, to avoid adding iterations
+    // that might divide by zero.
     void visit(const Div *op) override {
-        if (!inside_provide && !op->type.is_float()) {
-            Expr divisor = expand_expr(op->b, scope);
-            if (expr_depends_on_var(divisor, loop_var)) {
-                all_pure = false;
-            }
+        if (!inside_provide && !op->type.is_float() && !is_const(op->b)) {
+            all_pure = false;
         }
         IRVisitor::visit(op);
     }
@@ -131,16 +128,7 @@ class LoopSafeToExtend : public IRVisitor {
         all_pure = false;
     }
 
-    void visit(const LetStmt *op) override {
-
-        // TODO THIS IS NOT ENOUGH: For loops also introduce variables.
-
-        ScopedBinding<Expr> bind(scope, op->name, simplify(expand_expr(op->value, scope)));
-        IRVisitor::visit(op);
-    }
-
 public:
-    LoopSafeToExtend(const string &loop_var) : loop_var(loop_var) {}
 
     bool is_safe() const {
         if (!all_pure) {
@@ -557,12 +545,8 @@ class SlidingWindow : public IRMutator2 {
 
         if (!is_one(extent) && (op->for_type == ForType::Serial ||
                                 op->for_type == ForType::Unrolled)) {
-            LoopSafeToExtend safe_to_extend(op->name);
+            LoopSafeToExtend safe_to_extend;
             op->accept(&safe_to_extend);
-
-            // TODO: I should avoid messing with this loop if it has mutliple
-            // Produce blocks for the same Func, since I rely on Func name to
-            // determine guard offset.
 
             LoopExtension ext;
             for (const string &fn : funcs) {
