@@ -79,9 +79,9 @@ Expr expand_expr(Expr e, const Scope<Expr> &scope) {
 // Determines if the visited statement (which should a loop) is safe to extend
 // for more iterations while wrapping every Provide statement into an If stmt
 // that does nothing on the added iterations. Extending is not safe if any
-// loads (that may fault) or impure calls occur outside Provide (and so outside
-// of the guarding condition). It's also not safe if there's more than one
-// Produce for some function, since we track the offset for the guards only
+// impure calls or operations that can fault occur outside Provide (and so
+// outside of the guarding condition). It's also not safe if there's more than
+// one Produce for some function, since we track the offset for the guards only
 // at function granularity.
 class LoopSafeToExtend : public IRVisitor {
     map<string, int> produce_count;
