@@ -82,11 +82,13 @@ Expr expand_expr(Expr e, const Scope<Expr> &scope) {
 // impure calls or operations that can fault occur outside Provide (and so
 // outside of the guarding condition). It's also not safe if there's more than
 // one Produce for some function, since we track the offset for the guards only
-// at function granularity.
+// at function granularity. Finally, it's hard to figure out what parts of a
+// fused loop need to run on the additional iterations, so for now we don't try.
 class LoopSafeToExtend : public IRVisitor {
     map<string, int> produce_count;
     bool inside_provide = false;
     bool all_pure = true;
+    bool has_fused_loops = false;
 
     using IRVisitor::visit;
 
@@ -98,6 +100,11 @@ class LoopSafeToExtend : public IRVisitor {
     void visit(const ProducerConsumer *op) override {
         if (op->is_producer) {
             ++produce_count[op->name];
+            if (const auto *nested = op->body.as<ProducerConsumer>()) {
+                if (nested->is_producer) {
+                    has_fused_loops = true;
+                }
+            }
         }
         IRVisitor::visit(op);
     }
@@ -131,7 +138,7 @@ class LoopSafeToExtend : public IRVisitor {
 public:
 
     bool is_safe() const {
-        if (!all_pure) {
+        if (!all_pure || has_fused_loops) {
             return false;
         }
         for (const auto &pc : produce_count) {
@@ -483,12 +490,23 @@ class GuardAddedIterations : public IRMutator2 {
     const LoopExtension extension;
     string loop_var;
     Expr loop_min;
+    int64_t first_iteration;
 
     using IRMutator2::visit;
 
+    // Tracks the first iteration based on the Func we are producing.
+    Stmt visit(const ProducerConsumer *op) override {
+        if (!op->is_producer) {
+            return IRMutator2::visit(op);
+        }
+        int64_t new_first_iteration =
+            std::min(first_iteration, extension.first_iteration_for_func(op->name));
+        ScopedValue<int64_t> first_iter_scope(first_iteration, new_first_iteration);
+        return IRMutator2::visit(op);
+    }
+
     // Adds guarding Ifs around Provides.
     Stmt visit(const Provide *op) override {
-        int64_t first_iteration = extension.first_iteration_for_func(op->name);
         if (first_iteration == 0) {
             return IRMutator2::visit(op);
         }
@@ -500,7 +518,7 @@ class GuardAddedIterations : public IRMutator2 {
 
 public:
     GuardAddedIterations(const LoopExtension &e, const string &loop_var, const Expr &loop_min)
-        : extension(e), loop_var(loop_var), loop_min(loop_min) {}
+        : extension(e), loop_var(loop_var), loop_min(loop_min), first_iteration(e.max_increase) {}
 };
 
 // Perform sliding window optimization
