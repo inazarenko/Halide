@@ -138,7 +138,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    // Chain of p1 -> p2 -> consumer.
+    // Chain of f -> g -> consumer.
     {
         count = 0;
         Func f, g, h;
@@ -151,6 +151,44 @@ int main(int argc, char **argv) {
 
         Buffer<int> im = h.realize(10);
         constexpr int expected = 15 + 14;
+        if (count != expected) {
+            printf("f/g were called %d times instead of %d times\n", count, expected);
+            return -1;
+        }
+    }
+
+    // Same chain of f -> g -> consumer, but f doesn't slide.
+    {
+        count = 0;
+        Func f, g, h;
+        f(x) = call_counter(x, 0);
+        g(x) = call_counter(x, 1) + f(x);
+        h(x) = g(x-2) + g(x+2);
+
+        f.store_root().compute_at(g, x);
+        g.store_root().compute_at(h, x);
+
+        Buffer<int> im = h.realize(10);
+        constexpr int expected = 14 + 14;
+        if (count != expected) {
+            printf("f/g were called %d times instead of %d times\n", count, expected);
+            return -1;
+        }
+    }
+
+    // Same as above, but f has an update.
+    {
+        count = 0;
+        Func f, g, h;
+        f(x) = call_counter(x, 0);
+        f(x) = min(f(x), call_counter(x, 1));
+        g(x) = call_counter(x, 2) + f(x);
+        h(x) = g(x-2) + g(x+2);
+
+        g.store_root().compute_at(h, x);
+
+        Buffer<int> im = h.realize(10);
+        constexpr int expected = 14 + 14;
         if (count != expected) {
             printf("f/g were called %d times instead of %d times\n", count, expected);
             return -1;
