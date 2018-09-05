@@ -169,7 +169,7 @@ int main(int argc, char **argv) {
         g.store_root().compute_at(h, x).compute_with(f, x);
 
         Buffer<int> im = h.realize(10);
-        constexpr int expected = 11 + 14;
+        constexpr int expected = 12 + 13;
         if (count != expected) {
             printf("f/g were called %d times instead of %d times\n", count, expected);
             return -1;
