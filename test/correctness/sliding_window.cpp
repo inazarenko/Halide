@@ -12,13 +12,6 @@ using namespace Halide;
 int count = 0;
 extern "C" DLLEXPORT int call_counter(int x, int y) {
     count++;
-    // if (y == 0) {
-    //     printf("call f(%2d)\n", x);
-    // } else if (y == 1) {
-    //     printf("call g(%2d)\n", x);
-    // } else {
-    //     abort();
-    // }
     return 0;
 }
 HalideExtern_2(int, call_counter, int, int);
@@ -176,6 +169,7 @@ int main(int argc, char **argv) {
         }
     }
 
+
     // Same as above, but f has an update.
     {
         count = 0;
@@ -191,6 +185,26 @@ int main(int argc, char **argv) {
         constexpr int expected = 14 * 3;
         if (count != expected) {
             printf("f/g were called %d times instead of %d times\n", count, expected);
+            return -1;
+        }
+    }
+
+    // Sliding g, but one of its dependencies (f) has a more complex required
+    // box, because it's also used by h with a different access pattern.
+    {
+        count = 0;
+        Func f, g, h;
+        f(x) = call_counter(x, 0);
+        g(x) = f(x/2*2);
+        h(x) = g(x) + g(x+1) + f(x);
+
+        f.store_root().compute_at(h, x);
+        g.store_root().compute_at(h, x);
+
+        Buffer<int> im = h.realize(10);
+        constexpr int expected = 11;
+        if (count != expected) {
+            printf("f was called %d times instead of %d times\n", count, expected);
             return -1;
         }
     }
