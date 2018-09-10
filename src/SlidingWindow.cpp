@@ -244,9 +244,9 @@ class SlidingWindowOnFunctionAndLoop : public IRMutator2 {
 
     Stmt visit(const ProducerConsumer *op) override {
         if (!op->is_producer) {
-            // Check if the function we will be consuming in this scope is
-            // computed on the additional iterations. If not, we cannot use
-            // additional iterations in the scope.
+            // In this scope, we can only use additional iterations to align
+            // inner loops if the function we are consuming is actually computed
+            // on those iterations.
             bool can_extend_here = can_extend &&
                 extension.increase_per_func.count(op->name) != 0;
             ScopedValue<bool> can_extend_scope(can_extend, can_extend_here);
