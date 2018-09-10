@@ -189,6 +189,7 @@ class SlidingWindowOnFunctionAndLoop : public IRMutator2 {
     string loop_var;
     Expr loop_min;
     bool can_extend;
+    const LoopExtension &extension;
     Scope<Expr> &scope;
 
     map<string, Expr> replacements;
@@ -242,7 +243,15 @@ class SlidingWindowOnFunctionAndLoop : public IRMutator2 {
     }
 
     Stmt visit(const ProducerConsumer *op) override {
-        if (!op->is_producer || (op->name != func.name())) {
+        if (!op->is_producer) {
+            // Check if the function we will be consuming in this scope is
+            // computed on the additional iterations. If not, we cannot use
+            // additional iterations in the scope.
+            bool can_extend_here = can_extend &&
+                extension.increase_per_func.count(op->name) != 0;
+            ScopedValue<bool> can_extend_scope(can_extend, can_extend_here);
+            return IRMutator2::visit(op);
+        } else if (op->name != func.name()) {
             return IRMutator2::visit(op);
         } else {
             Stmt stmt = op;
@@ -478,8 +487,13 @@ class SlidingWindowOnFunctionAndLoop : public IRMutator2 {
     }
 
 public:
-    SlidingWindowOnFunctionAndLoop(Function f, string v, Expr v_min, bool can_extend, Scope<Expr> &scope)
-        : func(f), loop_var(v), loop_min(v_min), can_extend(can_extend), scope(scope), loop_extent_increase(0) {}
+    SlidingWindowOnFunctionAndLoop(Function f, string v, Expr v_min,
+                                   bool can_extend, const LoopExtension &ext,
+                                   Scope<Expr> &scope)
+        : func(f), loop_var(v), loop_min(v_min),
+          can_extend(can_extend), extension(ext),
+          scope(scope), loop_extent_increase(0) {
+    }
 
     int loop_extent_increase;
 };
@@ -571,7 +585,9 @@ class SlidingWindow : public IRMutator2 {
                 auto it = env.find(fn);
                 internal_assert(it != env.end());
                 SlidingWindowOnFunctionAndLoop mut(it->second, op->name, op->min,
-                                                   safe_to_extend.is_safe(), scope);
+                                                   safe_to_extend.is_safe(),
+                                                   ext,
+                                                   scope);
                 new_body = mut.mutate(new_body);
                 if (mut.loop_extent_increase > 0) {
                     ext.extend_for_func(fn, mut.loop_extent_increase);
