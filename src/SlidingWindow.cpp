@@ -502,8 +502,9 @@ public:
 // Provides of Funcs that we don't want to compute on those iterations.
 class GuardAddedIterations : public IRMutator2 {
     const LoopExtension extension;
-    string loop_var;
-    Expr loop_min;
+    const string loop_var;
+    const string loop_min_var;
+    const Expr loop_min;
     int64_t first_iteration;
 
     using IRMutator2::visit;
@@ -521,18 +522,32 @@ class GuardAddedIterations : public IRMutator2 {
 
     // Adds guarding Ifs around Provides.
     Stmt visit(const Provide *op) override {
+        Stmt result = IRMutator2::visit(op);
         if (first_iteration == 0) {
-            return IRMutator2::visit(op);
+            return result;
         }
         // loop_var >= loop_min + first_iteration.
         Expr cond = Variable::make(loop_min.type(), loop_var) >= loop_min +
             IntImm::make(loop_min.type(), first_iteration);
-        return IfThenElse::make(cond, op);
+        return IfThenElse::make(cond, result);
+    }
+
+    // Adjusts all references to the old loop_min.
+    Expr visit(const Variable *op) override {
+        if (op->name == loop_min_var) {
+            return Add::make(op, IntImm::make(op->type, extension.max_increase));
+        }
+        return IRMutator2::visit(op);
     }
 
 public:
-    GuardAddedIterations(const LoopExtension &e, const string &loop_var, const Expr &loop_min)
-        : extension(e), loop_var(loop_var), loop_min(loop_min), first_iteration(e.max_increase) {}
+    GuardAddedIterations(const LoopExtension &e, const string &loop_var,
+                         const Expr &loop_min)
+       : extension(e),
+         loop_var(loop_var),
+         loop_min_var(loop_var + ".loop_min"),
+         loop_min(loop_min),
+         first_iteration(e.max_increase) {}
 };
 
 // Perform sliding window optimization
